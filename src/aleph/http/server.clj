@@ -480,15 +480,11 @@
 
 ;;;
 
-(defn websocket-server-handler
-  [raw-stream?
-   ^Channel ch
+(defn aleph-server-handler
+  [^Channel ch
    ^WebSocketServerHandshaker handshaker]
   (let [d (d/deferred)
-        out (netty/sink ch false
-              #(if (instance? CharSequence %)
-                 (TextWebSocketFrame. (bs/to-string %))
-                 (BinaryWebSocketFrame. (netty/to-byte-buf ch %))))
+        out (netty/sink ch false identity)
         in (netty/buffered-source ch (constantly 1) 16)]
 
     (s/on-drained in
@@ -519,27 +515,55 @@
        ([_ ctx msg]
          (try
            (let [ch (.channel ctx)]
-             (when (instance? WebSocketFrame msg)
-               (let [^WebSocketFrame msg msg]
-                 (cond
-
-                   (instance? TextWebSocketFrame msg)
-                   (netty/put! ch in (.text ^TextWebSocketFrame msg))
-
-                   (instance? BinaryWebSocketFrame msg)
-                   (let [body (.content ^BinaryWebSocketFrame msg)]
-                     (netty/put! ch in
-                       (if raw-stream?
-                         body
-                         (netty/buf->array body))))
-
-                   (instance? PingWebSocketFrame msg)
-                   (.writeAndFlush ch (PongWebSocketFrame. (netty/acquire (.content msg))))
-
-                   (instance? CloseWebSocketFrame msg)
-                   (.close handshaker ch (netty/acquire msg))))))
+             (netty/put! ch in msg))
            (finally
              (netty/release msg)))))]))
+
+
+(defn websocket-handler
+  [raw-stream?
+   ^WebSocketServerHandshaker handshaker]
+  (netty/channel-handler
+
+    :write
+    ([_ ctx msg ch]
+      (try
+        (.write
+          ctx
+          (if (instance? CharSequence msg)
+            (TextWebSocketFrame. (bs/to-string msg))
+            (BinaryWebSocketFrame. (netty/to-byte-buf ch msg)))
+          ch)
+        (finally
+          (netty/release msg))))
+
+    :channel-read
+    ([_ ctx msg]
+      (try
+        (let [ch (.channel ctx)]
+          (when (instance? WebSocketFrame msg)
+            (let [^WebSocketFrame msg msg]
+              (cond
+
+                (instance? TextWebSocketFrame msg)
+                (.fireChannelRead ctx
+                                  (.text ^TextWebSocketFrame msg))
+
+                (instance? BinaryWebSocketFrame msg)
+                (let [body (.content ^BinaryWebSocketFrame msg)]
+                  (.fireChannelRead ctx
+                                    (if raw-stream?
+                                      body
+                                      (netty/buf->array body)))
+
+                  (instance? PingWebSocketFrame msg)
+                  (.writeAndFlush ch (PongWebSocketFrame. (netty/acquire (.content msg))))
+
+                  (instance? CloseWebSocketFrame msg)
+                  (.close handshaker ch (netty/acquire msg)))))))
+        (finally
+          (netty/release msg))))))
+
 
 (defn initialize-websocket-handler
   [^NettyRequest req
@@ -559,7 +583,8 @@
         factory (WebSocketServerHandshakerFactory. url nil allow-extensions? max-frame-payload)]
     (if-let [handshaker (.newHandshaker factory req)]
       (try
-        (let [[s ^ChannelHandler handler] (websocket-server-handler raw-stream? ch handshaker)
+        (let [[s ^ChannelHandler aleph-handler] (aleph-server-handler ch handshaker)
+              ^ChannelHandler websocket-handler (websocket-handler raw-stream? handshaker)
               p (.newPromise ch)
               h (DefaultHttpHeaders.)]
           (http/map->headers! h headers)
@@ -572,7 +597,8 @@
                 (let [pipeline (.pipeline ch)]
                   (.remove pipeline "request-handler")
                   (.addLast pipeline "websocket-frame-aggregator" (WebSocketFrameAggregator. max-frame-size))
-                  (.addLast pipeline "websocket-handler" handler)
+                  (.addLast pipeline "websocket-handler" websocket-handler)
+                  (.addLast pipeline "aleph-handler" aleph-handler)
                   s)))
             (d/catch'
               (fn [e]
